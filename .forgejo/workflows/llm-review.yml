@@ -1,8 +1,13 @@
 name: LLM Code Review
 
+# Self-contained inline job (no cross-repo workflow_call). The shared review
+# script still lives in the public scarrow/ci repo and is fetched at runtime,
+# so logic stays centralized — but there is no reusable-workflow expansion,
+# which is the fragile path on Codeberg's multi-runner self-hosted setup.
+
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, reopened]
 
 jobs:
   review:
@@ -12,13 +17,36 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Fetch PR base for accurate diff
+        run: |
+          git fetch --no-tags origin "${{ github.event.pull_request.base.sha }}" || true
+          git fetch --no-tags origin "${{ github.event.pull_request.base.ref }}" || true
+
+      - name: Fetch review script from scarrow/ci
+        run: |
+          curl -fsSL \
+            "https://codeberg.org/scarrow/ci/raw/tag/v1/.forgejo/scripts/llm-review.py" \
+            -o /tmp/llm-review.py
+
       - name: LLM per-file review
         env:
           CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
-          LLM_HOST: http://aws-ec2:8002
-          LLM_MODEL: gemma4:26b
-          LLM_FALLBACK: http://macbook-m4:11434
+          # Route through the LiteLLM front door on the Proxmox inference-stack
+          # (CT110 :4000). The legacy aws-ec2:8002 307-balancer is deprecated and
+          # now hangs (single backend node, 180s/0-byte). The OpenAI path sends
+          # Bearer auth (LiteLLM enforces keys); the ollama path does not, so it
+          # is unusable here.
+          REVIEW_PROVIDER: openai
+          OPENAI_BASE_URL: http://100.64.0.6:4000/v1
+          OPENAI_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          OPENAI_MODEL: llb-chat-qwen3-8b
+          # Fast-fail fallback: keep LLM_HOST/FALLBACK on LiteLLM (401s instantly
+          # without auth) instead of the dead :8002 default, so a key failure
+          # surfaces immediately rather than hanging the runner.
+          LLM_HOST: http://100.64.0.6:4000
+          LLM_FALLBACK: http://100.64.0.6:4000
+          LLM_MODEL: llb-chat-qwen3-8b
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 .forgejo/scripts/llm-review.py
+        run: python3 /tmp/llm-review.py
